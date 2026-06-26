@@ -30,6 +30,7 @@
 
 #include "../../core/sr_module.h"
 #include "../../core/parser/msg_parser.h"
+#include "../../core/parser/parse_uri.h"
 
 typedef int (*regapi_save_f)(sip_msg_t *msg, str *table, int flags);
 int regapi_save(sip_msg_t *msg, str *table, int flags);
@@ -49,6 +50,8 @@ int regapi_lookup_to_dset(sip_msg_t *msg, str *table, str *uri);
 typedef int (*regapi_set_q_override_f)(sip_msg_t *msg, str *new_q);
 int regapi_set_q_override(sip_msg_t *msg, str *new_q);
 
+typedef int (*regapi_extract_aor_f)(str *uri, str *aor, sip_uri_t *parsed_uri);
+
 /**
  * @brief REGISTRAR API structure
  */
@@ -61,6 +64,7 @@ typedef struct registrar_api
 	regapi_lookup_uri_f lookup_to_dset;
 	regapi_lookup_f registered;
 	regapi_set_q_override_f set_q_override;
+	regapi_extract_aor_f extract_aor;
 } registrar_api_t;
 
 typedef int (*bind_registrar_f)(registrar_api_t *api);

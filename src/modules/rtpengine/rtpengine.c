@@ -63,6 +63,7 @@
 #include "../../core/parser/parse_to.h"
 #include "../../core/parser/parse_uri.h"
 #include "../../core/parser/parser_f.h"
+#include "../../core/parser/parse_content.h"
 #include "../../core/parser/sdp/sdp.h"
 #include "../../core/resolve.h"
 #include "../../core/timer.h"
@@ -86,11 +87,14 @@
 #include "../../core/cfg/cfg_struct.h"
 #include "../../core/rand/fastrand.h"
 #include "../../modules/tm/tm_load.h"
+#include "../../modules/registrar/api.h"
+#include "../../modules/usrloc/usrloc.h"
 #include "../../modules/lwsc/api.h"
 #include "rtpengine.h"
 #include "rtpengine_funcs.h"
 #include "rtpengine_hash.h"
 #include "rtpengine_dmq.h"
+#include "siprec_metadata.h"
 #include "bencode.h"
 #include "config.h"
 #include "api.h"
@@ -129,6 +133,7 @@ enum {
 
 struct ng_flags_parse {
 	int via, to, packetize, transport, directional;
+	int siprec_auto;
 	bencode_item_t *dict, *flags, *direction, *replace, *rtcp_mux, *sdes, *t38,
 			*received_from, *codec, *codec_strip, *codec_offer,
 			*codec_transcode, *codec_mask, *codec_set, *codec_except, *codec_accept,
@@ -285,6 +290,8 @@ static int rtpengine_unsubscribe(
 static bencode_item_t *w_rtpengine_subscribe_wrap(
 		struct rtpengine_session *sess, enum rtpe_operation op, str *to_tag,
 		str *flags, unsigned int subscribe_flags, str *body);
+static int siprec_auto_start(struct sip_msg *msg);
+static void siprec_auto_stop(struct sip_msg *msg);
 static int fixup_set_id(void **param, int param_no);
 static int fixup_free_set_id(void **param, int param_no);
 static int set_rtpengine_set_f(struct sip_msg *msg, char *str1, char *str2);
@@ -428,12 +435,55 @@ static int rtpengine_ping_interval = 60;
 static int rtpengine_enable_dmq = 0;
 str rtpengine_dmq_peer_id = str_init("rtpengine");
 
+/* max recorder contacts considered per recorded call (both AoRs combined) */
+#define SIPREC_AUTO_MAX_TARGETS 64
+
+static str siprec_auto_usrloc_domain = str_init("location");
+static usrloc_api_t siprec_auto_ul;
+static registrar_api_t siprec_auto_reg;
+static udomain_t *siprec_auto_udomain = NULL;
+static int siprec_auto_ul_loaded = 0;
+static int siprec_auto_reg_loaded = 0;
+
+typedef enum siprec_auto_rec_state {
+	SIPREC_AUTO_PENDING = 0,
+	SIPREC_AUTO_ACTIVE,
+	SIPREC_AUTO_STOPPING
+} siprec_auto_rec_state_t;
+
 /* clang-format off */
 typedef struct rtpp_set_link {
 	struct rtpp_set *rset;
 	pv_spec_t *rpv;
 } rtpp_set_link_t;
 /* clang-format on */
+
+typedef struct siprec_auto_rec
+{
+	str orig_callid;
+	str orig_from_tag;
+	str orig_to_tag;
+	str rtpe_to_tag;
+	str ruri;
+	str dst_uri;
+	str local_uri;
+	str remote_uri;
+	str rec_callid;
+	str rec_from_tag;
+	unsigned int cseq;
+	siprec_auto_rec_state_t state;
+	unsigned int refcnt;
+	dlg_t *dlg;
+	struct siprec_auto_rec *next;
+} siprec_auto_rec_t;
+
+typedef struct siprec_auto_state {
+	gen_lock_t *lock;
+	siprec_auto_rec_t *records;
+} siprec_auto_state_t;
+
+static siprec_auto_state_t *siprec_auto_state = NULL;
+static void siprec_auto_free_rec(siprec_auto_rec_t *rec);
 
 /* tm */
 static struct tm_binds tmb;
@@ -604,6 +654,7 @@ static param_export_t params[] = {
 	{"dtmf_event_volume", PARAM_STR, &dtmf_event_volume_pvar_str},
 	{"event_callback",  PARAM_STR, &rtpe_event_callback},
 	{"enable_dmq", PARAM_INT, &rtpengine_enable_dmq},
+	{"siprec_auto_usrloc_domain", PARAM_STR, &siprec_auto_usrloc_domain},
 	/* MOS stats output */
 	/* global averages */
 	{"mos_min_pv", PARAM_STR, &global_mos_stats.min.mos_param},
@@ -2599,6 +2650,26 @@ static int mod_init(void)
 		memset(&tmb, 0, sizeof(struct tm_binds));
 	}
 
+	siprec_auto_state = shm_mallocxz(sizeof(*siprec_auto_state));
+	if(siprec_auto_state == NULL) {
+		LM_ERR("failed to allocate SIPREC auto shared state\n");
+		return -1;
+	}
+	siprec_auto_state->lock = lock_alloc();
+	if(siprec_auto_state->lock == NULL) {
+		LM_ERR("failed to allocate SIPREC auto lock\n");
+		shm_free(siprec_auto_state);
+		siprec_auto_state = NULL;
+		return -1;
+	}
+	if(lock_init(siprec_auto_state->lock) == NULL) {
+		LM_ERR("failed to initialize SIPREC auto lock\n");
+		lock_dealloc(siprec_auto_state->lock);
+		shm_free(siprec_auto_state);
+		siprec_auto_state = NULL;
+		return -1;
+	}
+
 	/* Determine IP addr type (IPv4 or IPv6 allowed) */
 	force_send_ip_af = get_ip_type(force_send_ip_str);
 	if(force_send_ip_af != AF_INET && force_send_ip_af != AF_INET6
@@ -3126,6 +3197,30 @@ static int child_init(int rank)
 
 static void mod_destroy(void)
 {
+	siprec_auto_rec_t *rec, *next;
+
+	if(siprec_auto_state != NULL) {
+		if(siprec_auto_state->lock != NULL)
+			lock_get(siprec_auto_state->lock);
+		rec = siprec_auto_state->records;
+		siprec_auto_state->records = NULL;
+		if(siprec_auto_state->lock != NULL)
+			lock_release(siprec_auto_state->lock);
+
+		while(rec) {
+			next = rec->next;
+			rec->next = NULL;
+			siprec_auto_free_rec(rec);
+			rec = next;
+		}
+
+		if(siprec_auto_state->lock != NULL) {
+			lock_destroy(siprec_auto_state->lock);
+			lock_dealloc(siprec_auto_state->lock);
+		}
+		shm_free(siprec_auto_state);
+		siprec_auto_state = NULL;
+	}
 }
 
 
@@ -3553,6 +3648,8 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 							ng_flags->dict, "repacketize", ng_flags->packetize);
 				} else if(str_eq(&key, "directional"))
 					ng_flags->directional = 1;
+				else if(str_eq(&key, "siprec-auto") && !val.s)
+					ng_flags->siprec_auto = 1;
 				else
 					goto generic;
 				goto next;
@@ -3633,6 +3730,8 @@ static bencode_item_t *rtpp_function_call(bencode_buffer_t *bencbuf,
 	struct rtpp_node *node;
 	char *cp;
 	char branch_buf[MAX_BRANCH_PARAM_LEN];
+	int flags_from_extra = 0;
+	int sdp_from_extra = 0;
 
 	body.s = NULL;
 
@@ -3656,18 +3755,22 @@ static bencode_item_t *rtpp_function_call(bencode_buffer_t *bencbuf,
 		}
 	}
 
-	/* initialize bencode buffer */
-	if(bencode_buffer_init(bencbuf)) {
-		LM_ERR("could not initialize bencode_buffer_t\n");
-		return NULL;
-	}
-
-	/* initialize some basic bencode items */
 	if(!extra_dict) {
+		/* initialize bencode buffer */
+		if(bencode_buffer_init(bencbuf)) {
+			LM_ERR("could not initialize bencode_buffer_t\n");
+			return NULL;
+		}
+
+		/* initialize some basic bencode items */
 		ng_flags.dict = bencode_dictionary(bencbuf);
 	} else {
 		ng_flags.dict = extra_dict;
 		ng_flags.flags = bencode_dictionary_get(ng_flags.dict, "flags");
+		if(ng_flags.flags)
+			flags_from_extra = 1;
+		if(bencode_dictionary_get(ng_flags.dict, "sdp"))
+			sdp_from_extra = 1;
 		bencode_dictionary_get_str(ng_flags.dict, "call-id", &tmp_callid);
 		if(tmp_callid.len > 0) {
 			ng_flags.call_id = tmp_callid;
@@ -3696,7 +3799,8 @@ static bencode_item_t *rtpp_function_call(bencode_buffer_t *bencbuf,
 			ng_flags.codec = bencode_dictionary(bencbuf);
 		}
 	}
-	if(op == OP_OFFER || op == OP_ANSWER || op == OP_SUBSCRIBE_ANSWER) {
+	if((op == OP_OFFER || op == OP_ANSWER || op == OP_SUBSCRIBE_ANSWER)
+			&& !(op == OP_SUBSCRIBE_ANSWER && sdp_from_extra)) {
 		/* get SDP body */
 		if(read_sdp_pvar != NULL) {
 			if(read_sdp_pvar->getf(msg, &read_sdp_pvar->pvp, &pv_val) < 0) {
@@ -3729,8 +3833,14 @@ static bencode_item_t *rtpp_function_call(bencode_buffer_t *bencbuf,
 						  : 0;
 
 	/* module specific parsing */
-	if(parse_by_module && flags && parse_flags(&ng_flags, msg, &op, flags->s))
-		goto error;
+	if(parse_by_module && flags) {
+		if(parse_flags(&ng_flags, msg, &op, flags->s))
+			goto error;
+		if(ng_flags.siprec_auto)
+			msg->msg_flags |= FL_RTPENGINE_SIPREC_AUTO;
+		else
+			msg->msg_flags &= ~FL_RTPENGINE_SIPREC_AUTO;
+	}
 
 	/* if it's not SIP, check additionally if the call-id and from tag have been set at all */
 	if(!IS_SIP(msg) && !IS_SIP_REPLY(msg)) {
@@ -3832,7 +3942,7 @@ static bencode_item_t *rtpp_function_call(bencode_buffer_t *bencbuf,
 	}
 
 	/* flags */
-	if(ng_flags.flags && ng_flags.flags->child)
+	if(ng_flags.flags && ng_flags.flags->child && !flags_from_extra)
 		bencode_dictionary_add(ng_flags.dict, "flags", ng_flags.flags);
 
 	/* add rtpp flags, if parsed by daemon */
@@ -5520,11 +5630,926 @@ static int set_rtpengine_set_f(struct sip_msg *msg, char *str1, char *str2)
 	return 1;
 }
 
+static int siprec_auto_str_eq(str *a, str *b)
+{
+	return a != NULL && b != NULL && a->len == b->len
+		   && (a->len == 0 || strncmp(a->s, b->s, a->len) == 0);
+}
+
+static void siprec_auto_log_rec(const char *event, siprec_auto_rec_t *rec)
+{
+	if(rec == NULL)
+		return;
+	LM_DBG("siprec-auto event=%s callid=<%.*s> from=<%.*s> to=<%.*s> state=%d refcnt=%u\n",
+			event, rec->orig_callid.len, rec->orig_callid.s,
+			rec->orig_from_tag.len, rec->orig_from_tag.s,
+			rec->orig_to_tag.len, rec->orig_to_tag.s, rec->state,
+			rec->refcnt);
+}
+
+static void siprec_auto_rec_ref_locked(siprec_auto_rec_t *rec)
+{
+	if(rec == NULL)
+		return;
+	rec->refcnt++;
+}
+
+static siprec_auto_rec_t *siprec_auto_rec_unref_locked(siprec_auto_rec_t *rec)
+{
+	if(rec == NULL)
+		return NULL;
+	if(rec->refcnt == 0) {
+		LM_CRIT("SIPREC auto record refcnt underflow\n");
+		return NULL;
+	}
+	rec->refcnt--;
+	return (rec->refcnt == 0) ? rec : NULL;
+}
+
+static void siprec_auto_rec_unref(siprec_auto_rec_t *rec)
+{
+	siprec_auto_rec_t *to_free;
+
+	if(rec == NULL || siprec_auto_state == NULL)
+		return;
+	lock_get(siprec_auto_state->lock);
+	to_free = siprec_auto_rec_unref_locked(rec);
+	lock_release(siprec_auto_state->lock);
+	if(to_free != NULL)
+		siprec_auto_free_rec(to_free);
+}
+
+static int siprec_auto_rec_matches_msg(siprec_auto_rec_t *rec, str *callid,
+		str *from_tag, str *to_tag, int strict_tags)
+{
+	if(rec == NULL || !siprec_auto_str_eq(&rec->orig_callid, callid))
+		return 0;
+
+	if(strict_tags && to_tag != NULL && to_tag->len > 0) {
+		/* In-dialog BYE can arrive from either direction. Require the Call-ID
+		 * and exact dialog tag pair so one fork does not stop another. */
+		return (siprec_auto_str_eq(&rec->orig_from_tag, from_tag)
+				   && siprec_auto_str_eq(&rec->orig_to_tag, to_tag))
+			   || (siprec_auto_str_eq(&rec->orig_from_tag, to_tag)
+					   && siprec_auto_str_eq(&rec->orig_to_tag, from_tag));
+	}
+
+	/* CANCEL/early failure may not have a To tag; only pending records may be
+	 * cleaned by Call-ID plus the originating From tag in that case. */
+	return rec->state == SIPREC_AUTO_PENDING
+		   && siprec_auto_str_eq(&rec->orig_from_tag, from_tag);
+}
+
+static int siprec_auto_msg_dialog_id(
+		struct sip_msg *msg, str *callid, str *from_tag, str *to_tag)
+{
+	if(get_callid(msg, callid) < 0 || get_from_tag(msg, from_tag) < 0)
+		return -1;
+	if(get_to_tag(msg, to_tag) < 0) {
+		to_tag->s = NULL;
+		to_tag->len = 0;
+	}
+	return (callid->len > 0 && from_tag->len > 0) ? 0 : -1;
+}
+
+static siprec_auto_rec_t *siprec_auto_find_locked(
+		str *callid, str *from_tag, str *to_tag)
+{
+	siprec_auto_rec_t *it;
+
+	for(it = siprec_auto_state->records; it; it = it->next) {
+		if(it->state != SIPREC_AUTO_STOPPING
+				&& siprec_auto_str_eq(&it->orig_callid, callid)
+				&& siprec_auto_str_eq(&it->orig_from_tag, from_tag)
+				&& siprec_auto_str_eq(&it->orig_to_tag, to_tag)) {
+			return it;
+		}
+	}
+	return NULL;
+}
+
+static siprec_auto_rec_t *siprec_auto_find_msg_locked(
+		str *callid, str *from_tag, str *to_tag, int strict_tags)
+{
+	siprec_auto_rec_t *it;
+
+	for(it = siprec_auto_state->records; it; it = it->next) {
+		if(siprec_auto_rec_matches_msg(it, callid, from_tag, to_tag,
+				   strict_tags)) {
+			return it;
+		}
+	}
+	return NULL;
+}
+
+static int siprec_auto_unlink_rec_locked(siprec_auto_rec_t *rec)
+{
+	siprec_auto_rec_t **it;
+
+	if(rec == NULL)
+		return 0;
+	for(it = &siprec_auto_state->records; *it; it = &(*it)->next) {
+		if(*it == rec) {
+			*it = rec->next;
+			rec->next = NULL;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static siprec_auto_rec_t *siprec_auto_detach_locked(siprec_auto_rec_t *rec)
+{
+	if(rec == NULL)
+		return NULL;
+	rec->state = SIPREC_AUTO_STOPPING;
+	/* The list holds one reference; drop it only if we actually unlinked the
+	 * record here, so a second detach (e.g. INVITE callback racing a BYE that
+	 * already detached) cannot underflow the refcount. */
+	if(!siprec_auto_unlink_rec_locked(rec))
+		return NULL;
+	return siprec_auto_rec_unref_locked(rec);
+}
+
+static void siprec_auto_detach(siprec_auto_rec_t *rec, const char *event)
+{
+	siprec_auto_rec_t *to_free;
+
+	if(rec == NULL)
+		return;
+	lock_get(siprec_auto_state->lock);
+	to_free = siprec_auto_detach_locked(rec);
+	siprec_auto_log_rec(event, rec);
+	lock_release(siprec_auto_state->lock);
+	if(to_free != NULL)
+		siprec_auto_free_rec(to_free);
+}
+
+static int siprec_auto_reserve(siprec_auto_rec_t *rec)
+{
+	if(rec == NULL)
+		return -1;
+
+	lock_get(siprec_auto_state->lock);
+	if(siprec_auto_find_locked(
+			   &rec->orig_callid, &rec->orig_from_tag, &rec->orig_to_tag)
+			!= NULL) {
+		lock_release(siprec_auto_state->lock);
+		siprec_auto_log_rec("duplicate_start_skipped", rec);
+		return 0;
+	}
+	rec->state = SIPREC_AUTO_PENDING;
+	rec->refcnt = 1;
+	rec->next = siprec_auto_state->records;
+	siprec_auto_state->records = rec;
+	siprec_auto_log_rec("reserved", rec);
+	lock_release(siprec_auto_state->lock);
+	return 1;
+}
+
+static int siprec_auto_bind_usrloc(void)
+{
+	bind_usrloc_t bind_usrloc;
+
+	if(siprec_auto_ul_loaded)
+		return 0;
+
+	bind_usrloc = (bind_usrloc_t)find_export("ul_bind_usrloc", 1, 0);
+	if(bind_usrloc == NULL || bind_usrloc(&siprec_auto_ul) < 0) {
+		memset(&siprec_auto_ul, 0, sizeof(usrloc_api_t));
+		siprec_auto_udomain = NULL;
+		LM_DBG("usrloc is not available for siprec-auto\n");
+		return -1;
+	}
+
+	siprec_auto_ul_loaded = 1;
+	LM_DBG("bound usrloc API for siprec-auto\n");
+	return 0;
+}
+
+static int siprec_auto_bind_registrar(void)
+{
+	if(siprec_auto_reg_loaded)
+		return 0;
+
+	if(registrar_load_api(&siprec_auto_reg) < 0
+			|| siprec_auto_reg.extract_aor == NULL) {
+		memset(&siprec_auto_reg, 0, sizeof(siprec_auto_reg));
+		LM_ERR("registrar API is not available for siprec-auto\n");
+		return -1;
+	}
+	siprec_auto_reg_loaded = 1;
+	LM_DBG("bound registrar API for siprec-auto\n");
+	return 0;
+}
+
+static int siprec_auto_get_udomain(void)
+{
+	if(siprec_auto_udomain != NULL)
+		return 0;
+
+	if(siprec_auto_bind_usrloc() < 0)
+		return -1;
+
+	if(siprec_auto_ul.get_udomain(siprec_auto_usrloc_domain.s,
+			   &siprec_auto_udomain)
+			< 0) {
+		LM_ERR("usrloc domain [%s] not found for siprec-auto\n",
+				siprec_auto_usrloc_domain.s);
+		return -1;
+	}
+
+	LM_DBG("using usrloc domain [%s] for siprec-auto\n",
+			siprec_auto_usrloc_domain.s);
+	return 0;
+}
+
+static int siprec_auto_make_aor(str *uri, str *aor)
+{
+	if(siprec_auto_bind_registrar() < 0)
+		return -1;
+	return siprec_auto_reg.extract_aor(uri, aor, NULL);
+}
+
+/* null-terminated pkg copy of a str (SIP strs are not NUL-terminated);
+ * caller pkg_free's the result. Returns NULL on bad input or OOM. */
+static char *siprec_auto_cstr(str *s)
+{
+	char *p;
+	if(s == NULL || s->s == NULL || s->len < 0)
+		return NULL;
+	p = pkg_malloc(s->len + 1);
+	if(p == NULL)
+		return NULL;
+	if(s->len > 0)
+		memcpy(p, s->s, s->len);
+	p[s->len] = '\0';
+	return p;
+}
+
+/* Build the RFC 7865 recording metadata via the siprec_metadata
+ * builder from "github.com/voicetel/mod_siprec" (urn:ietf:params:xml:ns:recording:1). The builder works on libc
+ * heap and NUL-terminated C strings, so we marshal the SIP fields into temp
+ * pkg copies, then hand the result back to callers as a pkg str. */
+static str siprec_auto_build_metadata(struct sip_msg *msg,
+		struct rtpengine_streams *streams, str *callid)
+{
+	str body = STR_NULL;
+	struct to_body *fb, *tb;
+	char *xml = NULL;
+	char *callid_c = NULL, *from_uri_c = NULL, *to_uri_c = NULL;
+	char *from_disp_c = NULL, *to_disp_c = NULL;
+	char *p_caller_id = NULL, *p_callee_id = NULL;
+	char stream_ids[RTP_SUBSCRIBE_MAX_STREAMS][24];
+	char stream_labels[RTP_SUBSCRIBE_MAX_STREAMS][16];
+	siprec_metadata_participant_t parts[2];
+	siprec_metadata_stream_t st[RTP_SUBSCRIBE_MAX_STREAMS];
+	siprec_metadata_options_t mopts;
+	char associate_time[40];
+	time_t now;
+	struct tm tmv;
+	int i, n;
+
+	fb = get_from(msg);
+	tb = get_to(msg);
+	if(fb == NULL || tb == NULL)
+		return body;
+
+	callid_c = siprec_auto_cstr(callid);
+	from_uri_c = siprec_auto_cstr(&fb->uri);
+	to_uri_c = siprec_auto_cstr(&tb->uri);
+	if(callid_c == NULL || from_uri_c == NULL || to_uri_c == NULL)
+		goto done;
+	if(fb->display.len > 0)
+		from_disp_c = siprec_auto_cstr(&fb->display);
+	if(tb->display.len > 0)
+		to_disp_c = siprec_auto_cstr(&tb->display);
+
+	/* participant_id only needs to be unique within this document and
+	 * stable across re-INVITEs; derive it from the Call-ID. "-caller" is
+	 * 7 chars + NUL. */
+	p_caller_id = pkg_malloc(callid->len + 8);
+	p_callee_id = pkg_malloc(callid->len + 8);
+	if(p_caller_id == NULL || p_callee_id == NULL)
+		goto done;
+	memcpy(p_caller_id, callid->s, callid->len);
+	memcpy(p_caller_id + callid->len, "-caller", 8);
+	memcpy(p_callee_id, callid->s, callid->len);
+	memcpy(p_callee_id + callid->len, "-callee", 8);
+
+	now = time(NULL);
+	gmtime_r(&now, &tmv);
+	strftime(associate_time, sizeof(associate_time), "%Y-%m-%dT%H:%M:%SZ",
+			&tmv);
+
+	memset(parts, 0, sizeof(parts));
+	parts[0].participant_id = p_caller_id;
+	parts[0].aor = from_uri_c;
+	parts[0].display_name = from_disp_c; /* NULL omits <name> */
+	parts[1].participant_id = p_callee_id;
+	parts[1].aor = to_uri_c;
+	parts[1].display_name = to_disp_c;
+
+	n = 0;
+	for(i = 0; i < streams->count && n < RTP_SUBSCRIBE_MAX_STREAMS; i++) {
+		snprintf(stream_ids[n], sizeof(stream_ids[n]), "stream-%d",
+				streams->streams[i].label);
+		snprintf(stream_labels[n], sizeof(stream_labels[n]), "%d",
+				streams->streams[i].label);
+		st[n].stream_id = stream_ids[n];
+		st[n].label = stream_labels[n];
+		/* RFC 7866 §8.5: <send> for the caller leg, <recv> for the callee;
+		 * the metadata label must match the SDP a=label. */
+		st[n].mode = (streams->streams[i].leg == RTPENGINE_CALLER)
+							 ? SIPREC_STREAM_SEND
+							 : SIPREC_STREAM_RECV;
+		st[n].participant_idx =
+				(streams->streams[i].leg == RTPENGINE_CALLER) ? 0 : 1;
+		n++;
+	}
+
+	memset(&mopts, 0, sizeof(mopts));
+	mopts.session_id = callid_c;
+	mopts.group_id = callid_c;
+	mopts.associate_time_utc = associate_time;
+	mopts.datamode = SIPREC_DATAMODE_COMPLETE;
+	mopts.participants = parts;
+	mopts.participant_count = 2;
+	mopts.streams = st;
+	mopts.stream_count = (size_t)n;
+
+	xml = siprec_metadata_build(&mopts);
+	if(xml == NULL) {
+		LM_ERR("siprec-auto metadata build failed for call <%.*s>\n",
+				callid->len, callid->s);
+		goto done;
+	}
+
+	/* hand the body to callers in pkg memory; release the builder's libc buf */
+	body.len = strlen(xml);
+	body.s = pkg_malloc(body.len + 1);
+	if(body.s == NULL) {
+		body.len = 0;
+		goto done;
+	}
+	memcpy(body.s, xml, body.len + 1);
+
+done:
+	if(xml)
+		siprec_metadata_free(xml);
+	if(callid_c)
+		pkg_free(callid_c);
+	if(from_uri_c)
+		pkg_free(from_uri_c);
+	if(to_uri_c)
+		pkg_free(to_uri_c);
+	if(from_disp_c)
+		pkg_free(from_disp_c);
+	if(to_disp_c)
+		pkg_free(to_disp_c);
+	if(p_caller_id)
+		pkg_free(p_caller_id);
+	if(p_callee_id)
+		pkg_free(p_callee_id);
+	return body;
+}
+
+static str siprec_auto_build_multipart(str *sdp, str *metadata, str *boundary)
+{
+	str body = STR_NULL;
+	int len = sdp->len + metadata->len + boundary->len * 4 + 256;
+
+	body.s = pkg_malloc(len);
+	if(body.s == NULL)
+		return body;
+	body.len = snprintf(body.s, len,
+			"--%.*s\r\nContent-Type: application/sdp\r\n\r\n%.*s\r\n"
+			"--%.*s\r\nContent-Type: application/rs-metadata+xml\r\n\r\n%.*s\r\n"
+			"--%.*s--\r\n",
+			boundary->len, boundary->s, sdp->len, sdp->s, boundary->len,
+			boundary->s, metadata->len, metadata->s, boundary->len,
+			boundary->s);
+	return body;
+}
+
+static siprec_auto_rec_t *siprec_auto_alloc_rec(str *orig_callid,
+		str *orig_from_tag, str *orig_to_tag, str *rtpe_to_tag, str *ruri,
+		str *dst_uri, str *local_uri, str *remote_uri)
+{
+	siprec_auto_rec_t *rec;
+	char *p;
+	unsigned int rnd = fastrand();
+	char callid_buf[128], tag_buf[64];
+	str rec_callid, rec_from_tag;
+	int sz;
+
+	rec_callid.len = snprintf(callid_buf, sizeof(callid_buf), "%.*s-siprec-%u",
+			orig_callid->len, orig_callid->s, rnd);
+	if(rec_callid.len >= (int)sizeof(callid_buf))
+		rec_callid.len = sizeof(callid_buf) - 1;
+	rec_callid.s = callid_buf;
+	rec_from_tag.len =
+			snprintf(tag_buf, sizeof(tag_buf), "siprec-%u", fastrand());
+	if(rec_from_tag.len >= (int)sizeof(tag_buf))
+		rec_from_tag.len = sizeof(tag_buf) - 1;
+	rec_from_tag.s = tag_buf;
+
+	sz = sizeof(*rec) + orig_callid->len + orig_from_tag->len
+	 + orig_to_tag->len + rtpe_to_tag->len + ruri->len + dst_uri->len
+	 + local_uri->len + remote_uri->len + rec_callid.len + rec_from_tag.len;
+	rec = shm_malloc(sz);
+	if(rec == NULL)
+		return NULL;
+	memset(rec, 0, sizeof(*rec));
+	p = (char *)(rec + 1);
+#define SIPREC_AUTO_SET(_dst, _src)       \
+	do {                                  \
+		(_dst).s = p;                     \
+		(_dst).len = (_src)->len;         \
+		memcpy(p, (_src)->s, (_src)->len); \
+		p += (_src)->len;                 \
+	} while(0)
+	SIPREC_AUTO_SET(rec->orig_callid, orig_callid);
+	SIPREC_AUTO_SET(rec->orig_from_tag, orig_from_tag);
+	SIPREC_AUTO_SET(rec->orig_to_tag, orig_to_tag);
+	SIPREC_AUTO_SET(rec->rtpe_to_tag, rtpe_to_tag);
+	SIPREC_AUTO_SET(rec->ruri, ruri);
+	SIPREC_AUTO_SET(rec->dst_uri, dst_uri);
+	SIPREC_AUTO_SET(rec->local_uri, local_uri);
+	SIPREC_AUTO_SET(rec->remote_uri, remote_uri);
+	SIPREC_AUTO_SET(rec->rec_callid, &rec_callid);
+	SIPREC_AUTO_SET(rec->rec_from_tag, &rec_from_tag);
+#undef SIPREC_AUTO_SET
+	rec->cseq = DEFAULT_CSEQ;
+	return rec;
+}
+
+static void siprec_auto_free_rec(siprec_auto_rec_t *rec)
+{
+	if(rec == NULL)
+		return;
+	siprec_auto_log_rec("freed", rec);
+	if(rec->dlg && tmb.free_dlg)
+		tmb.free_dlg(rec->dlg);
+	shm_free(rec);
+}
+
+static int siprec_auto_confirm_dlg(dlg_t *dlg, struct sip_msg *rpl)
+{
+	struct to_body *tb;
+
+	if(dlg == NULL || rpl == NULL)
+		return -1;
+	if(dlg->state == DLG_CONFIRMED)
+		return 0;
+
+	tb = get_to(rpl);
+	if(tb == NULL || tb->tag_value.len <= 0)
+		return -1;
+
+	if(dlg->id.rem_tag.s == NULL) {
+		dlg->id.rem_tag.s = shm_malloc(tb->tag_value.len);
+		if(dlg->id.rem_tag.s == NULL)
+			return -1;
+		memcpy(dlg->id.rem_tag.s, tb->tag_value.s, tb->tag_value.len);
+		dlg->id.rem_tag.len = tb->tag_value.len;
+	}
+	dlg->state = DLG_CONFIRMED;
+	if(tmb.calculate_hooks)
+		return tmb.calculate_hooks(dlg);
+	return 0;
+}
+
+static int siprec_auto_send_ack(siprec_auto_rec_t *rec)
+{
+	uac_req_t uac_r;
+	str method = str_init("ACK");
+
+	if(rec == NULL || rec->dlg == NULL || tmb.t_request_within == NULL)
+		return -1;
+
+	memset(&uac_r, 0, sizeof(uac_r));
+	uac_r.method = &method;
+	uac_r.dialog = rec->dlg;
+	if(tmb.t_request_within(&uac_r) < 0) {
+		LM_ERR("failed to send siprec-auto ACK to <%.*s>\n", rec->ruri.len,
+				rec->ruri.s);
+		return -1;
+	}
+	return 0;
+}
+
+static void siprec_auto_send_bye(siprec_auto_rec_t *rec)
+{
+	uac_req_t uac_r;
+	str method = str_init("BYE");
+
+	if(rec == NULL || rec->dlg == NULL || tmb.t_uac == NULL)
+		return;
+	memset(&uac_r, 0, sizeof(uac_r));
+	uac_r.method = &method;
+	uac_r.dialog = rec->dlg;
+	tmb.t_uac(&uac_r);
+	siprec_auto_log_rec("bye_attempted", rec);
+}
+
+static void siprec_auto_unsubscribe(siprec_auto_rec_t *rec)
+{
+	struct rtpengine_session sess;
+
+	if(rec == NULL)
+		return;
+	memset(&sess, 0, sizeof(sess));
+	sess.callid = &rec->orig_callid;
+	sess.from_tag = &rec->orig_from_tag;
+	sess.to_tag = &rec->orig_to_tag;
+	rtpengine_unsubscribe(&sess, &rec->rtpe_to_tag, NULL);
+	siprec_auto_log_rec("rtpengine_unsubscribe_attempted", rec);
+}
+
+static void siprec_auto_invite_cb(
+		struct cell *t, int type, struct tmcb_params *ps)
+{
+	siprec_auto_rec_t *rec, *to_free = NULL;
+	struct rtpengine_session sess;
+	str body = STR_NULL;
+	int mime;
+	int send_bye = 0;
+	int unsubscribe = 0;
+	int have_temp = 0;
+
+	if(ps == NULL || ps->param == NULL || *ps->param == NULL)
+		return;
+	rec = (siprec_auto_rec_t *)*ps->param;
+
+	if(type & TMCB_LOCAL_COMPLETED) {
+		if(ps->code >= 200 && ps->code < 300 && ps->rpl != NULL) {
+			int stopping = 0;
+
+			lock_get(siprec_auto_state->lock);
+			if(rec->state == SIPREC_AUTO_PENDING) {
+				siprec_auto_rec_ref_locked(rec);
+				have_temp = 1;
+			} else if(rec->state == SIPREC_AUTO_STOPPING) {
+				siprec_auto_rec_ref_locked(rec);
+				have_temp = 1;
+				stopping = 1;
+				send_bye = 1;
+				unsubscribe = 1;
+			}
+			lock_release(siprec_auto_state->lock);
+
+			if(have_temp != 0) {
+				/* Build the dialog (confirm, retarget, ACK) before publishing
+				 * ACTIVE. The dlg is touched only here, so a concurrent
+				 * siprec_auto_stop() cannot send a BYE on a half-built dialog:
+				 * until we publish ACTIVE, stop() takes the PENDING/no-BYE path
+				 * or leaves the rec STOPPING for us to tear down. */
+				if(siprec_auto_confirm_dlg(rec->dlg, ps->rpl) < 0) {
+					LM_ERR("failed to confirm siprec-auto dialog\n");
+					unsubscribe = 1;
+				} else if(rec->dst_uri.s != NULL && rec->dst_uri.len > 0
+						  && tmb.set_dlg_target
+						  && tmb.set_dlg_target(
+									 rec->dlg, &rec->ruri, &rec->dst_uri)
+									 < 0) {
+					LM_ERR("failed to set siprec-auto dialog target\n");
+					unsubscribe = 1;
+				} else if(siprec_auto_send_ack(rec) < 0) {
+					unsubscribe = 1;
+				} else if(!stopping) {
+					/* forward the recorder's SDP answer to rtpengine */
+					if(parse_headers(ps->rpl, HDR_CONTENTLENGTH_F, 0) == 0
+							&& ps->rpl->content_length != NULL
+							&& get_content_length(ps->rpl) > 0) {
+						mime = parse_content_type_hdr(ps->rpl);
+						if(mime > 0
+								&& (((unsigned int)mime) >> 16) == TYPE_APPLICATION
+								&& (mime & 0x00ff) == SUBTYPE_SDP
+								&& extract_body(ps->rpl, &body, NULL) >= 0
+								&& body.len > 0) {
+							memset(&sess, 0, sizeof(sess));
+							sess.callid = &rec->orig_callid;
+							sess.from_tag = &rec->orig_from_tag;
+							sess.to_tag = &rec->orig_to_tag;
+							rtpengine_subscribe_answer(
+									&sess, &rec->rtpe_to_tag, NULL, &body);
+						}
+					}
+
+					/* Dialog is usable: publish ACTIVE. If stop() raced in
+					 * while we were confirming, it left the rec STOPPING and
+					 * already unlinked it, so tear down instead. */
+					lock_get(siprec_auto_state->lock);
+					if(rec->state == SIPREC_AUTO_PENDING) {
+						rec->state = SIPREC_AUTO_ACTIVE;
+						siprec_auto_log_rec("invite_confirmed", rec);
+					} else if(rec->state == SIPREC_AUTO_STOPPING) {
+						stopping = 1;
+						send_bye = 1;
+						unsubscribe = 1;
+					}
+					lock_release(siprec_auto_state->lock);
+				}
+
+				/* On failure of a still-listed (PENDING) rec, drop the list
+				 * reference. detach is idempotent, so the STOPPING case (stop()
+				 * already unlinked) is a safe no-op on the refcount. */
+				if(unsubscribe && !stopping)
+					siprec_auto_detach(rec, "invite_failed");
+				if(send_bye)
+					siprec_auto_send_bye(rec);
+				if(unsubscribe)
+					siprec_auto_unsubscribe(rec);
+				siprec_auto_rec_unref(rec);
+			}
+		} else if(ps->code >= 300) {
+			lock_get(siprec_auto_state->lock);
+			if(rec->state == SIPREC_AUTO_PENDING) {
+				to_free = siprec_auto_detach_locked(rec);
+				unsubscribe = 1;
+				siprec_auto_log_rec("invite_failed", rec);
+			}
+			lock_release(siprec_auto_state->lock);
+			if(unsubscribe)
+				siprec_auto_unsubscribe(rec);
+			if(to_free != NULL)
+				siprec_auto_free_rec(to_free);
+		}
+	}
+
+	if(type & TMCB_DESTROY) {
+		siprec_auto_rec_unref(rec);
+	}
+}
+
+typedef struct siprec_auto_target
+{
+	str contact;
+	str received;
+} siprec_auto_target_t;
+
+static int siprec_auto_send_invite(struct sip_msg *msg, siprec_auto_rec_t *rec,
+		str *sdp, struct rtpengine_streams *streams)
+{
+	uac_req_t uac_r;
+	str method = str_init("INVITE");
+	str metadata = STR_NULL, body = STR_NULL, headers = STR_NULL;
+	str boundary;
+	char boundary_buf[40];
+	int hlen;
+	int ret = -1;
+
+	/* randomized so the delimiter cannot appear inside the SDP/metadata parts */
+	boundary.s = boundary_buf;
+	boundary.len = snprintf(boundary_buf, sizeof(boundary_buf),
+			"kamailio-siprec-%u-%u", fastrand(), fastrand());
+
+	metadata = siprec_auto_build_metadata(msg, streams, &rec->orig_callid);
+	if(metadata.s == NULL)
+		return -1;
+	body = siprec_auto_build_multipart(sdp, &metadata, &boundary);
+	pkg_free(metadata.s);
+	if(body.s == NULL)
+		return -1;
+
+	if(tmb.new_dlg_uac(&rec->rec_callid, &rec->rec_from_tag, rec->cseq,
+			   &rec->local_uri, &rec->remote_uri, &rec->dlg)
+			< 0)
+		goto done;
+	if(rec->dst_uri.s != NULL && rec->dst_uri.len > 0 && tmb.set_dlg_target) {
+		if(tmb.set_dlg_target(rec->dlg, &rec->ruri, &rec->dst_uri) < 0)
+			goto done;
+	} else {
+		tmb.calculate_hooks(rec->dlg);
+	}
+
+	hlen = 256 + boundary.len + rec->local_uri.len;
+	headers.s = pkg_malloc(hlen);
+	if(headers.s == NULL)
+		goto done;
+	headers.len = snprintf(headers.s, hlen,
+			"Contact: <%.*s>;+sip.src\r\n"
+			"Require: siprec\r\n"
+			"Accept: application/sdp, application/rs-metadata+xml\r\n"
+			"Content-Type: multipart/mixed; boundary=%.*s\r\n",
+			rec->local_uri.len, rec->local_uri.s, boundary.len, boundary.s);
+
+	lock_get(siprec_auto_state->lock);
+	siprec_auto_rec_ref_locked(rec);
+	lock_release(siprec_auto_state->lock);
+
+	memset(&uac_r, 0, sizeof(uac_r));
+	uac_r.method = &method;
+	uac_r.headers = &headers;
+	uac_r.body = &body;
+	uac_r.dialog = rec->dlg;
+	uac_r.cb_flags = TMCB_LOCAL_COMPLETED | TMCB_DESTROY | TMCB_DONT_ACK;
+	uac_r.cb = siprec_auto_invite_cb;
+	uac_r.cbp = rec;
+	if(tmb.t_uac(&uac_r) < 0) {
+		LM_ERR("failed to send siprec-auto INVITE to <%.*s>\n", rec->ruri.len,
+				rec->ruri.s);
+		siprec_auto_rec_unref(rec);
+		goto done;
+	}
+	siprec_auto_log_rec("invite_sent", rec);
+	ret = 1;
+
+done:
+	if(headers.s)
+		pkg_free(headers.s);
+	if(body.s)
+		pkg_free(body.s);
+	return ret;
+}
+
+static int siprec_auto_collect_contacts(
+		str *aor, siprec_auto_target_t **targets, int *count)
+{
+	urecord_t *r;
+	ucontact_t *c;
+	int ret;
+	int len;
+
+	if(siprec_auto_get_udomain() < 0)
+		return -1;
+
+	siprec_auto_ul.lock_udomain(siprec_auto_udomain, aor);
+	ret = siprec_auto_ul.get_urecord(siprec_auto_udomain, aor, &r);
+	if(ret != 0) {
+		siprec_auto_ul.unlock_udomain(siprec_auto_udomain, aor);
+		LM_DBG("no usrloc record for siprec-auto AoR <%.*s>\n", aor->len,
+				aor->s);
+		return 0;
+	}
+	for(c = r->contacts; c && *count < SIPREC_AUTO_MAX_TARGETS; c = c->next) {
+		LM_DBG("siprec-auto contact candidate AoR <%.*s> contact <%.*s> "
+			   "flags=%u cflags=%u expires=%ld\n",
+				aor->len, aor->s, c->c.len, c->c.s, c->flags, c->cflags,
+				(long)c->expires);
+		if(VALID_CONTACT(c, time(NULL)) && (c->flags & FL_SIPREC)) {
+			len = sizeof(siprec_auto_target_t) + c->c.len + c->received.len;
+			targets[*count] = pkg_malloc(len);
+			if(targets[*count]) {
+				memset(targets[*count], 0, sizeof(siprec_auto_target_t));
+				targets[*count]->contact.s = (char *)(targets[*count] + 1);
+				targets[*count]->contact.len = c->c.len;
+				memcpy(targets[*count]->contact.s, c->c.s, c->c.len);
+				if(c->received.len > 0) {
+					targets[*count]->received.s =
+							targets[*count]->contact.s + c->c.len;
+					targets[*count]->received.len = c->received.len;
+					memcpy(targets[*count]->received.s, c->received.s,
+							c->received.len);
+				}
+				(*count)++;
+			}
+		}
+	}
+	siprec_auto_ul.release_urecord(r);
+	siprec_auto_ul.unlock_udomain(siprec_auto_udomain, aor);
+	return 0;
+}
+
+static int siprec_auto_start(struct sip_msg *msg)
+{
+	str callid = STR_NULL, from_tag = STR_NULL, to_tag = STR_NULL;
+	str from_aor, to_aor;
+	siprec_auto_target_t *targets[SIPREC_AUTO_MAX_TARGETS];
+	int count = 0, i, rret;
+	struct rtpengine_session sess;
+	str sdp = STR_NULL;
+	str *rtpe_to_tag = NULL;
+	struct rtpengine_streams streams;
+	str flags = str_init("all siprec");
+	str local_uri, remote_uri;
+	siprec_auto_rec_t *rec = NULL;
+
+	memset(targets, 0, sizeof(targets));
+
+	if(tmb.t_uac == NULL || tmb.new_dlg_uac == NULL) {
+		LM_ERR("tm UAC API is not available for siprec-auto\n");
+		return -1;
+	}
+	if(siprec_auto_get_udomain() < 0)
+		return -1;
+	if(siprec_auto_msg_dialog_id(msg, &callid, &from_tag, &to_tag) < 0
+			|| to_tag.len == 0)
+		return -1;
+	if(siprec_auto_make_aor(&get_from(msg)->uri, &from_aor) == 0)
+		siprec_auto_collect_contacts(&from_aor, targets, &count);
+	if(siprec_auto_make_aor(&get_to(msg)->uri, &to_aor) == 0)
+		siprec_auto_collect_contacts(&to_aor, targets, &count);
+
+	LM_DBG("siprec-auto found %d recording contacts for call <%.*s>\n", count,
+			callid.len, callid.s);
+	for(i = 0; i < count; i++) {
+		memset(&sess, 0, sizeof(sess));
+		memset(&streams, 0, sizeof(streams));
+		sdp.s = NULL;
+		sdp.len = 0;
+		sess.msg = msg;
+		sess.callid = &callid;
+		sess.from_tag = &from_tag;
+		sess.to_tag = &to_tag;
+		sess.branch = RTPENGINE_ALL_BRANCHES;
+		rtpe_to_tag = NULL;
+		if(rtpengine_subscribe_request(&sess, &rtpe_to_tag, &flags,
+				   RTP_SUBSCRIBE_MODE_SIPREC, &sdp, &streams)
+				<= 0
+				|| rtpe_to_tag == NULL) {
+			LM_ERR("siprec-auto subscribe request failed for <%.*s>\n",
+					targets[i]->contact.len, targets[i]->contact.s);
+			goto next_target;
+		}
+
+		local_uri = get_from(msg)->uri;
+		remote_uri = targets[i]->contact;
+		rec = siprec_auto_alloc_rec(&callid, &from_tag, &to_tag, rtpe_to_tag,
+				&targets[i]->contact, &targets[i]->received, &local_uri,
+				&remote_uri);
+		if(rec == NULL) {
+			LM_ERR("failed to allocate siprec-auto record\n");
+			goto unsubscribe_target;
+		}
+		rret = siprec_auto_reserve(rec);
+		if(rret <= 0) {
+			goto unsubscribe_target;
+		}
+		if(siprec_auto_send_invite(msg, rec, &sdp, &streams) < 0) {
+			LM_ERR("siprec-auto failed to send INVITE to <%.*s>\n",
+					targets[i]->contact.len, targets[i]->contact.s);
+			siprec_auto_unsubscribe(rec);
+			siprec_auto_detach(rec, "invite_send_failed");
+		}
+		rec = NULL;
+		goto next_target;
+
+unsubscribe_target:
+		if(rec != NULL) {
+			if(rec->refcnt > 0)
+				siprec_auto_detach(rec, "setup_failed");
+			else
+				siprec_auto_free_rec(rec);
+			rec = NULL;
+		}
+		memset(&sess, 0, sizeof(sess));
+		sess.callid = &callid;
+		sess.from_tag = &from_tag;
+		sess.to_tag = &to_tag;
+		rtpengine_unsubscribe(&sess, rtpe_to_tag, NULL);
+next_target:
+		if(rtpe_to_tag)
+			shm_free(rtpe_to_tag);
+		if(sdp.s)
+			pkg_free(sdp.s);
+		pkg_free(targets[i]);
+	}
+	return 1;
+}
+
+static void siprec_auto_stop(struct sip_msg *msg)
+{
+	str callid = STR_NULL, from_tag = STR_NULL, to_tag = STR_NULL;
+	siprec_auto_rec_t *rec = NULL, *to_free = NULL;
+	int strict_tags;
+	int was_active = 0;
+
+	if(siprec_auto_state == NULL
+			|| siprec_auto_msg_dialog_id(msg, &callid, &from_tag, &to_tag) < 0)
+		return;
+	strict_tags = (to_tag.len > 0);
+
+	lock_get(siprec_auto_state->lock);
+	rec = siprec_auto_find_msg_locked(&callid, &from_tag, &to_tag, strict_tags);
+	if(rec == NULL || rec->state == SIPREC_AUTO_STOPPING) {
+		lock_release(siprec_auto_state->lock);
+		return;
+	}
+	was_active = (rec->state == SIPREC_AUTO_ACTIVE);
+	siprec_auto_rec_ref_locked(rec);
+	to_free = siprec_auto_detach_locked(rec);
+	siprec_auto_log_rec(was_active ? "original_call_stopped_active"
+						 : "original_call_stopped_pending",
+			rec);
+	lock_release(siprec_auto_state->lock);
+
+	if(was_active)
+		siprec_auto_send_bye(rec);
+	siprec_auto_unsubscribe(rec);
+	if(to_free != NULL)
+		siprec_auto_free_rec(to_free);
+	siprec_auto_rec_unref(rec);
+}
+
 static int rtpengine_manage(struct sip_msg *msg, void *d)
 {
 	int method;
 	int nosdp;
+	int siprec_auto = 0;
 	tm_cell_t *t = NULL;
+	int ret;
 
 	if(route_type == BRANCH_FAILURE_ROUTE) {
 		/* do nothing in branch failure event route
@@ -5546,8 +6571,10 @@ static int rtpengine_manage(struct sip_msg *msg, void *d)
 					   | METHOD_UPDATE | METHOD_PRACK)))
 		return -1;
 
-	if(method & (METHOD_CANCEL | METHOD_BYE))
+	if(method & (METHOD_CANCEL | METHOD_BYE)) {
+		siprec_auto_stop(msg);
 		return rtpengine_delete(msg, d);
+	}
 
 	if(msg->msg_flags & FL_SDP_BODY)
 		nosdp = 0;
@@ -5555,8 +6582,15 @@ static int rtpengine_manage(struct sip_msg *msg, void *d)
 		nosdp = parse_sdp(msg);
 
 	if(msg->first_line.type == SIP_REQUEST) {
-		if((method & (METHOD_ACK | METHOD_PRACK)) && nosdp == 0)
-			return rtpengine_offer_answer(msg, d, OP_ANSWER, 0);
+		if((method & (METHOD_ACK | METHOD_PRACK)) && nosdp == 0) {
+			ret = rtpengine_offer_answer(msg, d, OP_ANSWER, 0);
+			if(msg->msg_flags & FL_RTPENGINE_SIPREC_AUTO)
+				siprec_auto = 1;
+			if(ret > 0 && siprec_auto) {
+				siprec_auto_start(msg);
+			}
+			return ret;
+		}
 		if(method == METHOD_UPDATE && nosdp == 0)
 			return rtpengine_offer_answer(msg, d, OP_OFFER, 0);
 		if(method == METHOD_INVITE && nosdp == 0) {
@@ -5567,21 +6601,34 @@ static int rtpengine_manage(struct sip_msg *msg, void *d)
 					t->uas.request->msg_flags |= FL_SDP_BODY;
 				}
 			}
-			if(route_type == FAILURE_ROUTE)
+			if(route_type == FAILURE_ROUTE) {
+				siprec_auto_stop(msg);
 				return rtpengine_delete(msg, d);
+			}
 			return rtpengine_offer_answer(msg, d, OP_OFFER, 0);
 		}
 	} else if(msg->first_line.type == SIP_REPLY) {
-		if(msg->first_line.u.reply.statuscode >= 300)
+		if(msg->first_line.u.reply.statuscode >= 300) {
+			siprec_auto_stop(msg);
 			return rtpengine_delete(msg, d);
+		}
 		if(nosdp == 0) {
 			if(method == METHOD_UPDATE)
 				return rtpengine_offer_answer(msg, d, OP_ANSWER, 0);
 			if(tmb.t_gett == NULL || tmb.t_gett() == NULL
 					|| tmb.t_gett() == T_UNDEFINED)
 				return rtpengine_offer_answer(msg, d, OP_ANSWER, 0);
-			if(tmb.t_gett()->uas.request->msg_flags & FL_SDP_BODY)
-				return rtpengine_offer_answer(msg, d, OP_ANSWER, 0);
+			if(tmb.t_gett()->uas.request->msg_flags & FL_SDP_BODY) {
+				ret = rtpengine_offer_answer(msg, d, OP_ANSWER, 0);
+				if(msg->msg_flags & FL_RTPENGINE_SIPREC_AUTO)
+					siprec_auto = 1;
+				if(ret > 0 && siprec_auto
+						&& msg->first_line.u.reply.statuscode >= 200
+						&& msg->first_line.u.reply.statuscode < 300) {
+					siprec_auto_start(msg);
+				}
+				return ret;
+			}
 			return rtpengine_offer_answer(msg, d, OP_OFFER, 0);
 		}
 	}

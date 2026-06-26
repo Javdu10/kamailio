@@ -32,6 +32,7 @@
 #include "lookup.h"
 #include "save.h"
 #include "api.h"
+#include "common.h"
 
 /**
  *
@@ -152,6 +153,7 @@ int bind_registrar(registrar_api_t *api)
 	api->lookup_to_dset = regapi_lookup_to_dset;
 	api->registered = regapi_registered;
 	api->set_q_override = regapi_set_q_override;
+	api->extract_aor = extract_aor;
 
 	return 0;
 }

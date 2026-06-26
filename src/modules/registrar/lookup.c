@@ -90,6 +90,10 @@ static int reg_lookup_filter_match(ucontact_t *ptr)
 {
 	tcp_connection_t *con = NULL;
 
+	if(ptr->flags & FL_SIPREC) {
+		return 0;
+	}
+
 	if(reg_lookup_filter_mode == 0 || _reg_lookup_filter.factive == 0) {
 		return 1;
 	}
@@ -384,6 +388,8 @@ int lookup_helper(struct sip_msg *_m, udomain_t *_d, str *_uri, int _mode)
 			if(!(VALID_CONTACT(ptr, act_time)
 					   || cfg_get(registrar, registrar_cfg,
 							   use_expired_contacts))) {
+				goto done;
+			} else if(ptr->flags & FL_SIPREC) {
 				goto done;
 			} else if(!allowed_method(_m, ptr)) {
 				ret = -2;

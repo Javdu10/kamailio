@@ -142,7 +142,8 @@ typedef enum request_method
 #define FL_VIA_NORECEIVED (1ULL << 34) /* no received test for incoming Via */
 /* apply msg changes before transaction is created */
 #define FL_MSG_APPLY_CHANGES (1ULL << 35)
-
+/* annotates the current sip_msg after parse_flags() consumes siprec-auto. */
+#define FL_RTPENGINE_SIPREC_AUTO (1ULL << 36)
 #define FL_MTU_FB_MASK (FL_MTU_TCP_FB | FL_MTU_TLS_FB | FL_MTU_SCTP_FB)
 
 

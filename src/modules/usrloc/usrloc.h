@@ -66,6 +66,7 @@ typedef enum flags
 	FL_DMQRPL = 1 << 1,		 /*!< DMQ replication */
 	FL_EXPCLB = 1 << 2,		 /*!< Expired callback executed */
 	FL_KASENT = 1 << 3,		 /*!< Keepalive sent to contact */
+	FL_SIPREC = 1 << 4,		 /*!< Contact is a SIPREC recorder */
 	FL_ALL = (int)0xFFFFFFFF /*!< All flags set */
 } flags_t;
 

@@ -236,6 +236,23 @@ static inline int no_contacts(sip_msg_t *_m, udomain_t *_d, str *_a, str *_h)
 	return 0;
 }
 
+static int reg_contact_has_siprec_srs(contact_t *_c)
+{
+	param_t *param;
+	static str siprec_srs = str_init("+sip.srs");
+
+	if(_c == NULL) {
+		return 0;
+	}
+	for(param = _c->params; param; param = param->next) {
+		if(param->name.len == siprec_srs.len
+				&& strncasecmp(param->name.s, siprec_srs.s, siprec_srs.len)
+						== 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
 
 /*! \brief
  * Fills the common part (for all contacts) of the info structure
@@ -369,6 +386,11 @@ static inline ucontact_info_t *pack_ci(struct sip_msg *_m, contact_t *_c,
 	}
 
 	if(_c != 0) {
+		ci.flags &= ~FL_SIPREC;
+		if(reg_contact_has_siprec_srs(_c)) {
+			ci.flags |= FL_SIPREC;
+		}
+
 		/* hook uri address - should be more than 'sip:' chars */
 		if(_c->uri.s != NULL && _c->uri.len > 4)
 			ci.c = &_c->uri;
